@@ -13,10 +13,9 @@ import type {
     TokenBalance,
 } from '@solana/kit';
 import {
-    decompileTransactionMessage,
-    getBase64Codec,
-    getCompiledTransactionMessageCodec,
-    getTransactionCodec,
+    decodeTransactionFromRpcResponse,
+    getAccountMetasFromCompiledTransactionMessage,
+    getInstructionsFromCompiledTransactionMessage,
     MAX_SUPPORTED_TRANSACTION_VERSION,
 } from '@solana/kit';
 import { parseAddMemoInstruction } from '@solana-program/memo';
@@ -78,41 +77,24 @@ function validateAmount(amount: number): void {
     }
 }
 
-function parseBase64Transaction(b64TransactionResponse: Base64EncodedDataResponse, meta: TransactionMeta) {
-    const [base64Transaction] = b64TransactionResponse;
-    const transactionBytes = getBase64Codec().encode(base64Transaction);
-    const transaction = getTransactionCodec().decode(transactionBytes);
-    const compiledMessage = getCompiledTransactionMessageCodec().decode(transaction.messageBytes);
-    const accountKeys = [...compiledMessage.staticAccounts];
-    const addressesByLookupTableAddress: Record<string, Address[]> = {};
+function parseTransaction(response: { transaction: Base64EncodedDataResponse; meta: TransactionMeta }) {
+    const { compiledMessage, loadedAddresses } = decodeTransactionFromRpcResponse(response);
     if (compiledMessage.version === 0 && compiledMessage.addressTableLookups?.length) {
         const lookups = compiledMessage.addressTableLookups;
-        const loaded = meta.loadedAddresses;
         if (
-            !loaded ||
-            loaded.writable.length !== lookups.reduce((total, lookup) => total + lookup.writableIndexes.length, 0) ||
-            loaded.readonly.length !== lookups.reduce((total, lookup) => total + lookup.readonlyIndexes.length, 0)
+            !response.meta.loadedAddresses ||
+            loadedAddresses.writable.length !==
+                lookups.reduce((total, lookup) => total + lookup.writableIndexes.length, 0) ||
+            loadedAddresses.readonly.length !==
+                lookups.reduce((total, lookup) => total + lookup.readonlyIndexes.length, 0)
         ) {
             throw new ValidateTransferError('missing or invalid loaded addresses');
         }
-
-        // RPC balances use static keys, then all loaded writable keys, then all
-        // loaded readonly keys. Kit needs the same addresses at their table indexes.
-        accountKeys.push(...loaded.writable, ...loaded.readonly);
-        let writableOffset = 0;
-        let readonlyOffset = 0;
-        for (const lookup of lookups) {
-            const addresses = (addressesByLookupTableAddress[lookup.lookupTableAddress] ??= []);
-            for (const index of lookup.writableIndexes) {
-                addresses[index] = loaded.writable[writableOffset++];
-            }
-            for (const index of lookup.readonlyIndexes) {
-                addresses[index] = loaded.readonly[readonlyOffset++];
-            }
-        }
     }
-    const decompiledMessage = decompileTransactionMessage(compiledMessage, { addressesByLookupTableAddress });
-    const instructions = [...decompiledMessage.instructions];
+    const instructions = getInstructionsFromCompiledTransactionMessage(compiledMessage, loadedAddresses);
+    const accountKeys = getAccountMetasFromCompiledTransactionMessage(compiledMessage, loadedAddresses).map(
+        meta => meta.address,
+    );
     return { instructions, accountKeys };
 }
 
@@ -166,7 +148,7 @@ export async function validateTransfer(
     if (!response) throw new ValidateTransferError('not found');
 
     const meta = getMeta(response.meta);
-    const { instructions, accountKeys } = parseBase64Transaction(response.transaction, meta);
+    const { instructions, accountKeys } = parseTransaction({ transaction: response.transaction, meta });
 
     // Transfer instruction must be the last instruction
     const instruction = instructions.pop();
